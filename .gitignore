@@ -10,3 +10,6 @@ htmlcov/
 .venv/
 dist/
 build/
+
+# Operator/bench-specific safety profile (not version-controlled)
+/devices.json

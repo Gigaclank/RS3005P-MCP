@@ -28,6 +28,13 @@ mcp = FastMCP("rs3005p")
 # Single active connection, set by `connect` and cleared by `disconnect`.
 _device: PowerSupply | None = None
 
+# Runtime override of which device in the library is active. None => fall back to
+# the RS3005P_DEVICE env var. Set by `select_device` / `connect(device=...)`.
+_selected_device: str | None = None
+
+# Float tolerance for envelope (widening) comparisons.
+_EPS = 1e-6
+
 
 def _require_device() -> PowerSupply:
     if _device is None:
@@ -38,17 +45,49 @@ def _require_device() -> PowerSupply:
     return _device
 
 
-def _active_profile() -> SafetyProfile | None:
-    """Resolve the operator-configured safety profile from the environment.
+def _load_library() -> dict | None:
+    """Re-read the profile library file (hot reload). None if none configured.
 
-    Reads the file/device named by ``RS3005P_PROFILE`` / ``RS3005P_DEVICE``.
-    Returns ``None`` (fail-loud, hardware-limited only) when no profile is set.
+    Read on every call so edits to ``devices.json`` (new devices, changed
+    limits) take effect without re-registering or restarting the server.
     """
     path = os.environ.get("RS3005P_PROFILE")
     if not path:
         return None
-    profiles = load_profiles(path)
-    return select_profile(profiles, os.environ.get("RS3005P_DEVICE"))
+    return load_profiles(path)
+
+
+def _active_profile() -> SafetyProfile | None:
+    """Resolve the active safety profile, honouring any runtime selection.
+
+    The active device is the runtime selection (`select_device` /
+    `connect(device=...)`) if set, else the ``RS3005P_DEVICE`` env var. Returns
+    ``None`` (fail-loud, hardware-limited only) when no library is configured.
+    """
+    library = _load_library()
+    if library is None:
+        return None
+    return select_profile(library, _selected_device or os.environ.get("RS3005P_DEVICE"))
+
+
+def _wider_dimensions(new: SafetyProfile, current: SafetyProfile) -> list[str]:
+    """Return the envelope dimensions in which *new* is wider than *current*.
+
+    Widening = less protection for the attached device, so switching across any
+    of these requires explicit confirmation.
+    """
+    reasons: list[str] = []
+    if new.voltage_max > current.voltage_max + _EPS:
+        reasons.append(f"voltage ceiling {current.voltage_max}->{new.voltage_max} V")
+    if new.current_max > current.current_max + _EPS:
+        reasons.append(f"current ceiling {current.current_max}->{new.current_max} A")
+    if current.power_max is not None and (
+        new.power_max is None or new.power_max > current.power_max + _EPS
+    ):
+        reasons.append("power ceiling raised or removed")
+    if not current.output_allowed and new.output_allowed:
+        reasons.append("output newly allowed")
+    return reasons
 
 
 @mcp.tool()
@@ -81,7 +120,83 @@ def get_safety_profile() -> dict:
 
 
 @mcp.tool()
-def connect(port: str, model: str = DEFAULT_MODEL, baudrate: int = 9600) -> dict:
+def list_devices() -> dict:
+    """List the device profiles available in the operator's library (read-only).
+
+    Shows each device's safe envelope and which one is currently active. The
+    library file is re-read live, so devices added to it appear without
+    restarting the server.
+    """
+    library = _load_library()
+    if library is None:
+        return {"library_configured": False, "note": "No DUT profile library set."}
+    active = _selected_device or os.environ.get("RS3005P_DEVICE")
+    return {
+        "library_configured": True,
+        "active": active,
+        "devices": {
+            name: {
+                "device": p.device,
+                "voltage_max": p.voltage_max,
+                "current_max": p.current_max,
+                "power_max": p.power_max,
+                "output_allowed": p.output_allowed,
+            }
+            for name, p in library.items()
+        },
+    }
+
+
+@mcp.tool()
+def select_device(name: str, confirm_widen: bool = False) -> dict:
+    """Switch the active safety profile to *name* from the operator's library.
+
+    The library file is re-read live. Switching to a profile whose envelope is
+    WIDER than the current one (higher voltage/current/power ceiling, or output
+    newly allowed) is refused unless ``confirm_widen=True`` -- this guards
+    against selecting a permissive profile for a more fragile attached device.
+    After switching, if the supply is connected it is forced into the new
+    envelope's safe baseline (output off / setpoints clamped) as needed.
+
+    Note: this selects among operator-curated profiles only; no tool can create
+    or modify a profile's limits.
+    """
+    global _selected_device
+    library = _load_library()
+    if library is None:
+        raise RuntimeError("No DUT profile library configured (set RS3005P_PROFILE).")
+    if name not in library:
+        raise ValueError(
+            f"Device {name!r} not in library; available: {sorted(library)}."
+        )
+
+    new_profile = library[name]
+    current = _active_profile()
+    if current is not None and current.name != name:
+        widened = _wider_dimensions(new_profile, current)
+        if widened and not confirm_widen:
+            raise ValueError(
+                f"Selecting '{name}' WIDENS the safety envelope "
+                f"({'; '.join(widened)}), reducing protection for the attached "
+                f"device. Re-call with confirm_widen=true only if the wired "
+                f"hardware truly tolerates it."
+            )
+
+    _selected_device = name
+    result: dict = {"selected_device": name, "envelope": new_profile.as_dict()}
+    if _device is not None:
+        _device.profile = new_profile
+        result["safety_actions"] = _device.enforce_safe_on_connect() or []
+    return result
+
+
+@mcp.tool()
+def connect(
+    port: str,
+    model: str = DEFAULT_MODEL,
+    baudrate: int = 9600,
+    device: str | None = None,
+) -> dict:
     """Open a serial connection to the power supply and verify it responds.
 
     Args:
@@ -89,14 +204,19 @@ def connect(port: str, model: str = DEFAULT_MODEL, baudrate: int = 9600) -> dict
         model: One of the supported models (sets the hardware limits).
             Defaults to RS-3005P (0-30 V, 0-5 A).
         baudrate: Serial baud rate; the manual specifies 9600.
+        device: Optional device name to select from the profile library for this
+            connection (overrides ``RS3005P_DEVICE``). Use `list_devices` to see
+            the options.
 
-    Applies the operator's active safety profile (if any). If the supply is
-    found already outputting outside the safe envelope, the output is forced off
-    and a warning is returned.
+    Applies the active safety profile (if any). If the supply is found already
+    outputting outside the safe envelope, it is forced to a safe baseline and a
+    warning is returned.
     """
-    global _device
+    global _device, _selected_device
     if model not in MODELS:
         raise ValueError(f"Unknown model {model!r}; supported: {sorted(MODELS)}.")
+    if device is not None:
+        _selected_device = device
     if _device is not None:
         _device.close()
         _device = None

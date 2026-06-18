@@ -201,6 +201,125 @@ def test_power_up_tool(monkeypatch, tmp_path):
     server.disconnect()
 
 
+def _write_lib3(tmp_path):
+    import json
+
+    path = tmp_path / "lib3.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "devices": {
+                    "wide": {
+                        "device": "wide",
+                        "voltage": {"nominal": 24.0, "tolerance": 0.5},
+                        "current": {"max": 1.0},
+                    },
+                    "narrow": {
+                        "device": "narrow",
+                        "voltage": {"min": 0.0, "max": 5.25},
+                        "current": {"max": 0.5},
+                    },
+                },
+            }
+        )
+    )
+    return str(path)
+
+
+def test_list_devices_tool(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "_selected_device", None)
+    monkeypatch.setattr(server, "_device", None)
+    monkeypatch.setenv("RS3005P_PROFILE", _write_lib3(tmp_path))
+    monkeypatch.setenv("RS3005P_DEVICE", "narrow")
+    out = server.list_devices()
+    assert out["library_configured"] is True
+    assert out["active"] == "narrow"
+    assert set(out["devices"]) == {"wide", "narrow"}
+    assert out["devices"]["wide"]["voltage_max"] == 24.5
+
+
+def test_select_device_narrowing_allowed(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "_selected_device", None)
+    monkeypatch.setattr(server, "_device", None)
+    monkeypatch.setenv("RS3005P_PROFILE", _write_lib3(tmp_path))
+    monkeypatch.setenv("RS3005P_DEVICE", "wide")
+    res = server.select_device("narrow")  # narrows V and I -> no confirm needed
+    assert res["selected_device"] == "narrow"
+    assert server._selected_device == "narrow"
+
+
+def test_select_device_widening_requires_confirm(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "_selected_device", None)
+    monkeypatch.setattr(server, "_device", None)
+    monkeypatch.setenv("RS3005P_PROFILE", _write_lib3(tmp_path))
+    monkeypatch.setenv("RS3005P_DEVICE", "narrow")
+    with pytest.raises(ValueError):
+        server.select_device("wide")  # widens voltage + current
+    res = server.select_device("wide", confirm_widen=True)
+    assert res["selected_device"] == "wide"
+
+
+def test_select_device_unknown(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "_selected_device", None)
+    monkeypatch.setattr(server, "_device", None)
+    monkeypatch.setenv("RS3005P_PROFILE", _write_lib3(tmp_path))
+    monkeypatch.setenv("RS3005P_DEVICE", "narrow")
+    with pytest.raises(ValueError):
+        server.select_device("nope")
+
+
+def test_select_device_applies_safe_baseline_live(monkeypatch, tmp_path):
+    fake = FakeKorad()
+    monkeypatch.setenv("RS3005P_PROFILE", _write_lib3(tmp_path))
+    monkeypatch.setenv("RS3005P_DEVICE", "wide")
+    monkeypatch.setattr(server, "_selected_device", None)
+    monkeypatch.setattr(server, "_device", None)
+    monkeypatch.setattr(
+        server, "open_serial", lambda port, baudrate=9600: SerialTransport(fake, command_delay=0.0)
+    )
+    server.connect("COM-TEST")
+    server.set_voltage(20.0)  # fine under 'wide' (24.5 V)
+    server.set_output(True)
+    # switch to 'narrow' (5.25 V ceiling): 20 V is now unsafe -> baseline reset
+    res = server.select_device("narrow")
+    assert res["selected_device"] == "narrow"
+    assert fake.output is False
+    assert res["safety_actions"]
+    server.disconnect()
+
+
+def test_connect_with_device_override(monkeypatch, tmp_path):
+    fake = FakeKorad()
+    monkeypatch.setenv("RS3005P_PROFILE", _write_lib3(tmp_path))
+    monkeypatch.delenv("RS3005P_DEVICE", raising=False)  # no default; ambiguous
+    monkeypatch.setattr(server, "_selected_device", None)
+    monkeypatch.setattr(server, "_device", None)
+    monkeypatch.setattr(
+        server, "open_serial", lambda port, baudrate=9600: SerialTransport(fake, command_delay=0.0)
+    )
+    res = server.connect("COM-TEST", device="narrow")
+    assert res["safety_profile"] == "narrow"
+    server.disconnect()
+
+
+def test_library_hot_reload(monkeypatch, tmp_path):
+    import json
+
+    path = tmp_path / "hot.json"
+    one = {"schema_version": "1.0", "devices": {"a": {"voltage": {"max": 5.0}, "current": {"max": 1.0}}}}
+    path.write_text(json.dumps(one))
+    monkeypatch.setattr(server, "_selected_device", None)
+    monkeypatch.setattr(server, "_device", None)
+    monkeypatch.setenv("RS3005P_PROFILE", str(path))
+    monkeypatch.setenv("RS3005P_DEVICE", "a")
+    assert set(server.list_devices()["devices"]) == {"a"}
+    # edit the file: add device b
+    one["devices"]["b"] = {"voltage": {"max": 9.0}, "current": {"max": 1.0}}
+    path.write_text(json.dumps(one))
+    assert set(server.list_devices()["devices"]) == {"a", "b"}  # picked up live
+
+
 def test_list_serial_ports(monkeypatch):
     class _Port:
         device = "COM7"

@@ -60,6 +60,8 @@ uv run rs3005p-mcp
 | `disconnect`         | Close the connection.                              |
 | `get_identification` | Read the `*IDN?` string.                           |
 | `get_safety_profile` | Read the active safety envelope (read-only).       |
+| `list_devices`       | List device profiles in the library + which is active.|
+| `select_device`      | Switch active profile (widening needs `confirm_widen`).|
 | `set_voltage`        | Set the voltage setpoint (range + safety validated).|
 | `set_current`        | Set the current limit (range + safety validated).  |
 | `ramp_voltage`       | Ramp voltage to a target within the slew limit.    |
@@ -84,6 +86,12 @@ at startup and **cannot be changed by any tool**.
 ```bash
 rs3005p-mcp --profile devices.json --device 24v-sensor
 ```
+
+`RS3005P_DEVICE`/`--device` is only the *default*; an agent can switch among the
+curated devices at runtime with `select_device` (widening the envelope requires
+`confirm_widen=true`) and `devices.json` edits hot-reload on the next
+`connect`/`select_device` — no re-registration. No tool can create or modify a
+profile's limits; the file stays operator-curated.
 
 See [`docs/safety.md`](docs/safety.md) and
 [`examples/devices.example.json`](examples/devices.example.json). With no profile

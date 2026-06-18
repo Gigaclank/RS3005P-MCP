@@ -6,14 +6,28 @@ operating envelope; once one is active, the server refuses any agent request
 that would leave that envelope. This is the mechanism that stops an AI agent
 from accidentally over-driving — and damaging — attached hardware.
 
-## Trust model (why an agent can't bypass it)
+## Trust model (what an agent can and can't do)
 
-- Profiles are loaded **at server startup** from a file (`RS3005P_PROFILE` env
-  var or `--profile`), and the active device is chosen at startup
-  (`RS3005P_DEVICE` env var or `--device`).
-- Both are **immutable at runtime**. No MCP tool can create, edit or switch a
-  profile — otherwise an agent could simply widen its own limits. The agent can
-  only *read* the active envelope via `get_safety_profile`.
+- The profile **library** is an operator-curated file (`RS3005P_PROFILE` env var
+  or `--profile`). **No MCP tool can create or modify a profile's limits**, so an
+  agent can never fabricate a wider envelope — the limits always come from a file
+  only the operator writes.
+- A tool *may* **select** which curated device is active (`select_device`,
+  `connect(device=...)`, or the `RS3005P_DEVICE` default), so you don't have to
+  re-register the server when you swap devices. Two guards make this safe:
+  - **Confirm-to-widen:** switching to a profile whose envelope is wider in any
+    dimension (higher voltage / current / power ceiling, or output newly
+    allowed) is refused unless `confirm_widen=True`.
+  - **Forced baseline on switch:** after any switch the supply is brought into
+    the new envelope (output off / setpoints clamped) before anything else.
+- **Residual risk you accept by enabling runtime selection:** if the *wrong*
+  profile is selected for the hardware that is physically wired (e.g. the 3.3 V
+  module is attached but the 23 V chassis profile is active), the supply will
+  permit the wider profile's voltage. Software cannot detect what is on the
+  terminals — matching the active profile to the attached device is the
+  operator's responsibility. The confirm-to-widen gate bounds the blast radius.
+- The library file is **re-read on every connect/select** (hot reload), so edits
+  to `devices.json` take effect without re-registering the server.
 
 ## Guardrails enforced (in `device.py`, before any byte is sent)
 
@@ -86,7 +100,20 @@ RS3005P_PROFILE=devices.json RS3005P_DEVICE=24v-sensor uv run rs3005p-mcp
 
 A single-device library needs no `--device` (the sole entry is selected); a
 multi-device library requires it (fail-loud, so the operator must name what is
-physically attached).
+physically attached) — though it can also be chosen later at runtime.
+
+### Switching device at runtime (no re-registration)
+
+`RS3005P_DEVICE` only sets the *default*. Once running, an agent can switch among
+the curated devices without restarting the server:
+
+- `list_devices` — show the library and which device is active.
+- `select_device(name)` — make `name` active; narrowing or equal envelopes apply
+  immediately, widening requires `select_device(name, confirm_widen=true)`.
+- `connect(port, device=name)` — select at connect time.
+
+Editing `devices.json` (adding a device or changing limits) takes effect on the
+next `connect`/`select_device` — no `claude mcp` re-registration needed.
 
 With a profile active, `power_up` brings the DUT to its nominal operating point:
 it sets the current limit to `current.nominal` (or `current.max`), ramps the
