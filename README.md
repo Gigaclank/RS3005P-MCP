@@ -59,8 +59,11 @@ uv run rs3005p-mcp
 | `connect`            | Open the port, pick the model, verify with `*IDN?`.|
 | `disconnect`         | Close the connection.                              |
 | `get_identification` | Read the `*IDN?` string.                           |
-| `set_voltage`        | Set the voltage setpoint (range-validated).        |
-| `set_current`        | Set the current limit (range-validated).           |
+| `get_safety_profile` | Read the active safety envelope (read-only).       |
+| `set_voltage`        | Set the voltage setpoint (range + safety validated).|
+| `set_current`        | Set the current limit (range + safety validated).  |
+| `ramp_voltage`       | Ramp voltage to a target within the slew limit.    |
+| `power_up`           | Bring the DUT to its profile's nominal operating point.|
 | `get_setpoints`      | Read configured voltage & current setpoints.       |
 | `measure`            | Read *actual* output voltage & current.            |
 | `set_output`         | Enable/disable the output terminals.               |
@@ -69,6 +72,23 @@ uv run rs3005p-mcp
 | `get_state`          | Full snapshot (setpoints + measurements + status). |
 | `save_settings`      | Store panel settings to memory slot 1–5.           |
 | `recall_settings`    | Recall panel settings from memory slot 1–5.        |
+
+## Safety profiles (protecting attached devices)
+
+To stop an agent from over-driving the device wired to the terminals, supply a
+**device-profile library** at launch. It defines a safe envelope (voltage /
+current / power ceilings, output gating, slew limit) per device; the server
+rejects any agent request that would leave it. Profiles are set by the operator
+at startup and **cannot be changed by any tool**.
+
+```bash
+rs3005p-mcp --profile devices.json --device 24v-sensor
+```
+
+See [`docs/safety.md`](docs/safety.md) and
+[`examples/devices.example.json`](examples/devices.example.json). With no profile
+the server runs limited only by hardware (30 V / 5 A) and says so on every
+`connect`.
 
 A typical agent flow:
 

@@ -39,6 +39,7 @@ def test_connect_verifies_and_stores(monkeypatch):
     def fake_open_serial(port, baudrate=9600):
         return SerialTransport(fake, command_delay=0.0)
 
+    monkeypatch.delenv("RS3005P_PROFILE", raising=False)
     monkeypatch.setattr(server, "_device", None)
     monkeypatch.setattr(server, "open_serial", fake_open_serial)
 
@@ -46,6 +47,7 @@ def test_connect_verifies_and_stores(monkeypatch):
     assert result["connected"] is True
     assert result["identification"] == "KORAD RS3005P V2.0"
     assert result["max_voltage"] == 30.0
+    assert result["safety_profile"] is None
     assert server._device is not None
 
     # Cleanup.
@@ -111,6 +113,92 @@ def test_memory_tools(connected: FakeKorad):
     server.set_voltage(1.0)
     assert server.recall_settings(2)["recalled_slot"] == 2
     assert server.get_setpoints()["voltage_setpoint"] == pytest.approx(20.0)
+
+
+def _write_library(tmp_path):
+    import json
+
+    path = tmp_path / "devices.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "devices": {
+                    "24v-sensor": {
+                        "device": "24 V sensor",
+                        "voltage": {"nominal": 24.0, "tolerance": 0.5},
+                        "current": {"max": 0.5, "nominal": 0.2},
+                        "power": {"max": 12.0},
+                        "max_voltage_step": 2.0,
+                    },
+                    "5v-logic": {
+                        "voltage": {"min": 0.0, "max": 5.25},
+                        "current": {"max": 1.0},
+                    },
+                },
+            }
+        )
+    )
+    return str(path)
+
+
+def _connect_with_profile(monkeypatch, tmp_path, device_name):
+    fake = FakeKorad()
+    monkeypatch.setenv("RS3005P_PROFILE", _write_library(tmp_path))
+    monkeypatch.setenv("RS3005P_DEVICE", device_name)
+    monkeypatch.setattr(server, "_device", None)
+    monkeypatch.setattr(
+        server, "open_serial", lambda port, baudrate=9600: SerialTransport(fake, command_delay=0.0)
+    )
+    result = server.connect("COM-TEST")
+    return fake, result
+
+
+def test_connect_applies_selected_profile(monkeypatch, tmp_path):
+    fake, result = _connect_with_profile(monkeypatch, tmp_path, "5v-logic")
+    assert result["safety_profile"] == "5v-logic"
+    # 5v-logic caps voltage at 5.25 V
+    server.set_voltage(5.0)
+    with pytest.raises(ValueError):
+        server.set_voltage(10.0)
+    server.disconnect()
+
+
+def test_connect_forces_off_unsafe_output(monkeypatch, tmp_path):
+    # Supply left live at 12 V, but 5v-logic envelope tops out at 5.25 V.
+    fake = FakeKorad()
+    fake.vset = 12.0
+    fake.output = True
+    monkeypatch.setenv("RS3005P_PROFILE", _write_library(tmp_path))
+    monkeypatch.setenv("RS3005P_DEVICE", "5v-logic")
+    monkeypatch.setattr(server, "_device", None)
+    monkeypatch.setattr(
+        server, "open_serial", lambda port, baudrate=9600: SerialTransport(fake, command_delay=0.0)
+    )
+    result = server.connect("COM-TEST")
+    assert fake.output is False
+    assert result["warnings"]
+    server.disconnect()
+
+
+def test_get_safety_profile_tool(monkeypatch, tmp_path):
+    monkeypatch.delenv("RS3005P_PROFILE", raising=False)
+    assert server.get_safety_profile()["profile_active"] is False
+    monkeypatch.setenv("RS3005P_PROFILE", _write_library(tmp_path))
+    monkeypatch.setenv("RS3005P_DEVICE", "24v-sensor")
+    active = server.get_safety_profile()
+    assert active["profile_active"] is True
+    assert active["name"] == "24v-sensor"
+    assert active["voltage_max"] == pytest.approx(24.5)
+
+
+def test_power_up_tool(monkeypatch, tmp_path):
+    fake, _ = _connect_with_profile(monkeypatch, tmp_path, "24v-sensor")
+    snap = server.power_up()
+    assert fake.output is True
+    assert snap["voltage_setpoint"] == pytest.approx(24.0)
+    assert snap["current_setpoint"] == pytest.approx(0.2)
+    server.disconnect()
 
 
 def test_list_serial_ports(monkeypatch):

@@ -36,10 +36,15 @@ without hardware, and so the serial/MCP concerns stay out of the protocol logic.
   so concurrent tool calls can't interleave on the wire. The `serial.Serial`
   object is *injected*, not constructed here, which is what lets the fake device
   stand in during tests.
-- **`device.py`** — the `PowerSupply` API the server uses. Adds the safety the
-  protocol layer omits: setpoints are validated against the model's envelope
-  **before** transmission, so out-of-range requests raise rather than reaching
-  hardware.
+- **`safety.py`** — pure data + checks (no I/O): `SafetyProfile` is the
+  operator-defined safe envelope for the *attached device under test*, loaded
+  from a multi-device library at startup. Immutable at runtime; no tool can
+  change it. See [`safety.md`](safety.md).
+- **`device.py`** — the `PowerSupply` API the server uses. Enforces two tiers
+  **before** transmission: the model's hardware envelope, then the optional
+  `SafetyProfile` (V/I/power ceilings, output gating, slew limiting). Out-of-range
+  requests raise rather than reaching hardware; an unsafe supply found at connect
+  is forced to a safe baseline.
 - **`server.py`** — thin MCP wrappers returning JSON-friendly dicts. No logic
   lives here beyond connection lifecycle.
 

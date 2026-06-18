@@ -1,0 +1,25 @@
+{
+  "schema_version": "1.0",
+  "devices": {
+    "24v-sensor": {
+      "device": "24 V industrial sensor",
+      "voltage": { "nominal": 24.0, "tolerance": 0.5 },
+      "current": { "max": 0.5, "nominal": 0.2 },
+      "power": { "max": 12.0 },
+      "output_allowed": true,
+      "max_voltage_step": 2.0
+    },
+    "5v-logic": {
+      "device": "5 V logic board",
+      "voltage": { "min": 0.0, "max": 5.25 },
+      "current": { "max": 1.0, "nominal": 0.3 },
+      "max_voltage_step": 1.0
+    },
+    "inspect-only": {
+      "device": "unknown DUT (no power)",
+      "voltage": { "min": 0.0, "max": 3.3 },
+      "current": { "max": 0.05 },
+      "output_allowed": false
+    }
+  }
+}

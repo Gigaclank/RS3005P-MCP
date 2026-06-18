@@ -20,13 +20,18 @@ There is no separate lint step configured. Coverage is reported automatically (`
 
 ## Architecture
 
-Five layers, each isolating one concern so the protocol can be proven without hardware. Data flows: MCP client → `server` → `device` → (`protocol` + `transport`) → serial port.
+Six layers, each isolating one concern so the protocol and safety logic can be proven without hardware. Data flows: MCP client → `server` → `device` → (`protocol` + `transport`) → serial port, with `device` also consulting a `safety` profile.
 
 - **`models.py`** — frozen `PowerSupplyModel` table (RS-3005P = 0–30 V, RS-6005P = 0–60 V). Holds output limits **and** the exact ASCII number format the firmware expects (`format_voltage`/`format_current`). Add a variant = one dict entry; never hard-code limits or formats elsewhere.
 - **`protocol.py`** — **pure** functions only (no I/O): `cmd_*` encode intentions to command bytes, `parse_float`/`decode_status` decode raw replies. This is the single source of truth for the wire protocol. `parse_float` extracts the first numeric token (tolerant of stray trailing bytes seen on real units).
 - **`transport.py`** — serial framing/timing. The `serial.Serial` object is **injected** into `SerialTransport`, not constructed inside it — that injection is what lets tests substitute the fake. `open_serial()` is the only place pyserial is imported (lazily). Handles the firmware quirks: no command terminators, ~50 ms inter-command delay, input-buffer flush before each exchange, a lock around request/response.
-- **`device.py`** — `PowerSupply`, the API the server uses. Adds the validation `protocol` deliberately omits: setpoints are range-checked against the model **before** transmission, so out-of-range requests raise instead of reaching hardware.
-- **`server.py`** — thin `@mcp.tool()` wrappers returning JSON-friendly dicts; owns one module-global `_device` connection (`connect`/`disconnect` lifecycle). Keep logic out of here — it belongs in `device`/`protocol`.
+- **`safety.py`** — **pure** data + checks (no I/O): `SafetyProfile` is an operator-defined safe envelope for the *attached device under test*. `load_profiles`/`select_profile` parse a multi-device library file. This is the agent-proof guardrail; see "Safety model" below.
+- **`device.py`** — `PowerSupply`, the API the server uses. Enforces two tiers **before** transmission: the model's hardware envelope, then (if attached) the `SafetyProfile`. Out-of-envelope requests raise instead of reaching hardware. `_force_safe_baseline`/`enforce_safe_on_connect` recover a supply found in an unsafe state.
+- **`server.py`** — thin `@mcp.tool()` wrappers returning JSON-friendly dicts; owns one module-global `_device` connection (`connect`/`disconnect` lifecycle). Resolves the active profile from the environment at connect (`_active_profile`). Keep logic out of here — it belongs in `device`/`protocol`/`safety`.
+
+## Safety model
+
+Load-bearing invariant — **do not weaken it**: the safety profile is loaded at server **startup** from `RS3005P_PROFILE` (file) + `RS3005P_DEVICE` (selector), or `--profile`/`--device`. It is immutable at runtime and **no MCP tool may create, modify, or switch it** — otherwise an agent could widen its own limits. Tools may only *read* it (`get_safety_profile`). Enforcement (V/I/power ceilings, output gating, slew limiting, connect/recall safe-baseline reset) lives in `device.py`; pure checks live in `safety.py`. Voltage `nominal±tolerance` sets the **upper ceiling** + nominal target with the floor at 0 V (ramping up / switching off must always be allowed); a hard floor needs explicit `{min, max}`. See `docs/safety.md`.
 
 ## Firmware/protocol facts that bite
 
@@ -38,4 +43,4 @@ Five layers, each isolating one concern so the protocol can be proven without ha
 ## Conventions
 
 - The protocol/transport split is load-bearing for testability — keep `protocol.py` I/O-free and keep the serial object injectable. New device capabilities should add a `cmd_*` (+ decoder) in `protocol`, a validated method in `device`, an emulator branch in `tests/conftest.py::FakeKorad`, then a thin tool in `server`.
-- See `docs/protocol.md` (command reference + status-byte table) and `docs/architecture.md` (layer diagram + manual hardware-verification steps).
+- See `docs/protocol.md` (command reference + status-byte table), `docs/architecture.md` (layer diagram + manual hardware-verification steps), and `docs/safety.md` (profile schema + guardrails).
